@@ -97,6 +97,12 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
+        # weight sharing scheme
+        # we do this because they are to an extent, inverses
+        # we also expect the wte to react similarly for synonyms, and the lm_head to give synonyms similar scores
+        # for more information, see https://arxiv.org/pdf/1608.05859 
+        self.transformer.wte.weight = self.lm_head.weight # also saves a lot of parameters
+
     def forward(self, idx, targets=None):
         # idx: (B, T)
         B, T = idx.shape
@@ -169,26 +175,50 @@ class GPT(nn.Module):
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-
-# start with training on shakespeare
 import tiktoken
-enc = tiktoken.get_encoding("gpt2")
-with open("input.txt", "r") as f:
-    text = f.read()
 
-text = text[:1000]
-tokens = enc.encode(text)
-B, T = 4, 32
-buf = torch.tensor(tokens[:B*T + 1])
-buf = buf.to(device)
-x = buf[:-1].view(B, T)
-y = buf[1:].view(B, T)
+class DataLoaderLite:
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
+
+        # load and store tokens
+        enc = tiktoken.get_encoding("gpt2")
+        with open("input.txt", "r") as f:
+            text = f.read()
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens)
+        print(f"Loaded {len(self.tokens)} tokens")
+        print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
+
+        self.current_position = 0
+        
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position:self.current_position + B*T + 1]
+        x = buf[:-1].view(B, T)
+        y = buf[1:].view(B, T) 
+
+        self.current_position += B*T
+
+        # if next batch is out of bounds, loop back around
+        if self.current_position + B*T+1 >= len(self.tokens):
+            self.current_position = 0
+
+        return x, y
+    
+
+
+train_loader = DataLoaderLite(B=4, T=32)
+
 
 model = GPT(GPTConfig()).to(device)
 
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 for i in range(50):
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
     logits, loss = model(x, y)
     optimizer.zero_grad()
     loss.backward()
