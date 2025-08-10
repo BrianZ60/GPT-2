@@ -32,10 +32,13 @@ class CasualSelfAttention(nn.Module):
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
         # multiply and scale by factor of sqrt(hs)
-        att = q @ k.transpose(-2, -1) * (1.0 / math.sqrt(k.size(-1))) # (B, nh, T, T)
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float("-inf")) # mask future tokens
-        att = F.softmax(att, dim=-1) # make attention sum to one
-        y = att @ v # the weighted sum. (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
+        # att = q @ k.transpose(-2, -1) * (1.0 / math.sqrt(k.size(-1))) # (B, nh, T, T)
+        # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float("-inf")) # mask future tokens
+        # att = F.softmax(att, dim=-1) # make attention sum to one
+        # y = att @ v # the weighted sum. (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
+        # Flash attention uses kernel fusion and avoids large reads/writes by using GPU on-chip memory more
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
         y = y.transpose(1, 2).contiguous().view(B, T, C) # (B, nh, T, hs) -> (B, T, nh, hs) -> (B, T, C)
         # transpose makes it not contiguous; we need contiguous for view()
         y = self.c_proj(y)
@@ -236,8 +239,11 @@ torch.set_float32_matmul_precision("high") # use TF32 (lower precision then FP32
 
 
 model = GPT(GPTConfig()).to(device)
-
-
+model = torch.compile(model)
+# What torch.compile() does:
+# 1. Views the entire network as a whole, allowing for more efficient processing and minimizes Python interpreter overhead
+# 2. Reduces read/write time btwn gpu and memory with operator fusion. This also mitigates memory bandwidth cost.
+    
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 for i in range(50):
     t0 = time.time()
@@ -247,7 +253,7 @@ for i in range(50):
     # with torch.autocast(device_type=device, dtype=torch.bfloat16):
         # logits, loss = model(x, y) # actually changes the datatype of logits, but others remain FP32 (mixed precision)
     logits, loss = model(x, y)
-    
+
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
