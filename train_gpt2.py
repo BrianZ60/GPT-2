@@ -191,7 +191,6 @@ class GPT(nn.Module):
 
         return model
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
 
 import tiktoken
 
@@ -226,8 +225,14 @@ class DataLoaderLite:
         return x, y
     
 
+import time
 
-train_loader = DataLoaderLite(B=4, T=32)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+train_loader = DataLoaderLite(B=4, T=128)
+
+torch.set_float32_matmul_precision("high") # use TF32 (lower precision then FP32, but faster)
+# variables are still FP32, but the matrix multi are TF32
 
 
 model = GPT(GPTConfig()).to(device)
@@ -235,13 +240,22 @@ model = GPT(GPTConfig()).to(device)
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 for i in range(50):
+    t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
+
+    # with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        # logits, loss = model(x, y) # actually changes the datatype of logits, but others remain FP32 (mixed precision)
     logits, loss = model(x, y)
+    
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
-    print(f"Step: {i}, loss: {loss.item()}")
+    # torch.cuda.synchronize() # wait for gpu to finish scheduled work before continuing
+    t1 = time.time()
+    dt = (t1 - t0)*1000 # amt of time in ms
+    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+    print(f"Step: {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}")
 
 import sys; sys.exit(0) # skip eval for now 
 
