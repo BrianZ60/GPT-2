@@ -465,7 +465,6 @@ for step in range(max_steps):
 
                 checkpoint = {
                     "model": raw_model.state_dict(),
-                    "config": raw_model.config,
                     "step": step,
                     "val_loss": val_loss_accum.item(),
                     "optimizer": optimizer.state_dict(),
