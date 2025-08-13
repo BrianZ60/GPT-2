@@ -9,7 +9,7 @@ import multiprocessing as mp # running multiple processes in parallel
 import numpy as np
 import tiktoken
 from datasets import load_dataset
-from tqdm import tqdm 
+from tqdm import tqdm
 
 local_dir = "fineweb-edu-10B"
 

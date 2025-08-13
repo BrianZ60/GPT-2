@@ -65,14 +65,14 @@ def render_example(example):
 def evaluate(model_type, device):
     torch.set_float32_matmul_precision("high") # tf32
     model = GPT2LMHeadModel.from_pretrained(model_type).to(device)
-    model = torch.compile(model)
+    # model = torch.compile(model)
 
 
     num_correct = 0
     num_examples = 0
 
     gs = load_dataset("PleIAs/GoldenSwag", split="validation")
-    for example in gs:
+    for i, example in enumerate(gs):
         tokens, mask, label = render_example(example)
         tokens = tokens.to(device)
         mask = mask.to(device)
@@ -84,7 +84,7 @@ def evaluate(model_type, device):
 
         # flatten to calculate CE loss
         flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1))
-        flat_shift_tokens = shift_logits.view(-1)
+        flat_shift_tokens = shift_tokens.view(-1)
 
         shift_losses = F.cross_entropy(flat_shift_logits, flat_shift_tokens, reduction="none") # default reduction is "mean", but we want a tensor of losses for each token
 
@@ -99,7 +99,7 @@ def evaluate(model_type, device):
         pred = avg_loss.argmin().item()
 
         num_examples += 1
-        num_correct += int(pred == label)
+        num_correct += int(pred == int(label))
 
         print(f"Evaluated {num_examples} examples | acc: {num_correct}/{num_examples}={num_correct/num_examples:.4f}")
 
@@ -110,6 +110,9 @@ def evaluate(model_type, device):
             for i, end in enumerate(example["endings"]):
                 print(f"{i} (loss: {avg_loss[i].item():.4f}) | {end}")
             print(f"predicted: {pred}, actual: {label}")
+        
+        
+
 
 if __name__ == "__main__":
     import argparse
