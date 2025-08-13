@@ -68,7 +68,7 @@ def evaluate(model_type, device):
     model = torch.compile(model)
 
 
-    num_corerct = 0
+    num_correct = 0
     num_examples = 0
 
     gs = load_dataset("PleIAs/GoldenSwag", split="validation")
