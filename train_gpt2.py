@@ -146,6 +146,7 @@ class GPT(nn.Module):
 
         logits = self.lm_head(x) # (B, T, vocab_size)
 
+
         loss = None
         if targets is not None:
             # flatten logits into (B*T, vocab_size) and targets into (B*T)
@@ -406,7 +407,7 @@ raw_model = model.module if ddp else model
 max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 715 # openai warmed up for 375M tokens, 375M // total_batch_size = 715
-max_steps = 19073 # 10B tokens // total_batch_size = steps for one epoch
+max_steps = 19073 * 2 # 10B tokens // total_batch_size = steps for one epoch
 
 def get_lr(it):
   # linear warmup for first warmup_steps steps
@@ -430,10 +431,19 @@ log_dir = "log"
 os.makedirs(log_dir, exist_ok = True)
 log_file = os.path.join(log_dir, "log.txt")
 
-with open(log_file, "w") as f:
-    pass # clear the log_file
+# with open(log_file, "w") as f:
+#     pass # clear the log_file
 
-for step in range(max_steps):
+save = torch.load("log/model_19072.pt")
+model.load_state_dict(save["model"])
+start_step = save["step"]
+val_save_loss = save["val_loss"]
+optimizer.load_state_dict(save["optimizer"])
+torch.set_rng_state(save["rng_state"])
+torch.cuda.set_rng_state_all(save["cuda_rng_state"])
+
+
+for step in range(start_step, max_steps):
     t0 = time.time()
 
     last_step = (step == max_steps - 1)
@@ -470,7 +480,6 @@ for step in range(max_steps):
                     "optimizer": optimizer.state_dict(),
                     "rng_state": torch.get_rng_state(),
                     "cuda_rng_state": torch.cuda.get_rng_state_all(),
-                    "sample_rng_state": sample_rng.get_state()
                 }
 
                 torch.save(checkpoint, checkpoint_path)
