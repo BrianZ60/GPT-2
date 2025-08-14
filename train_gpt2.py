@@ -8,6 +8,8 @@ import time
 import os
 from datasets import load_dataset
 from goldenswag import render_example
+import random
+
 
 
 
@@ -205,6 +207,7 @@ class GPT(nn.Module):
 
 
     def configure_optimizers(self, weight_decay, learning_rate, device):
+
         param_dict = {name : param for name, param in self.named_parameters() if param.requires_grad}
 
         # weight decay discourages model from relying too heavy on a weight by penalizing large weights
@@ -223,19 +226,16 @@ class GPT(nn.Module):
         num_decay_params = sum(p.numel() for p in decay_params) # counts total number of elements (parameters)
         num_no_decay_params = sum(p.numel() for p in no_decay_params)
 
-        if master_process:
-            print(f"num decayed param tensors: {len(decay_params)}, totaling {num_decay_params:,} parameters")
-            print(f"num non-decayed parameter tensors: {len(no_decay_params)}, totaling {num_no_decay_params:,} parameters")
+        print("Configured optimizer with weight decay")
+        print(f"- num decayed param tensors: {len(decay_params)}, totaling {num_decay_params:,} parameters")
+        print(f"- num non-decayed parameter tensors: {len(no_decay_params)}, totaling {num_no_decay_params:,} parameters")
 
         use_fused = "cuda" in device
-        if master_process:
-            print(f"fused AdamW: {use_fused}")
+        print(f"- fused AdamW: {use_fused}\n")
 
         optimizer = torch.optim.AdamW(params=optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
 
         return optimizer
-
-
 
 
 
@@ -319,6 +319,23 @@ def get_most_likely_row(tokens, mask, logits):
     return pred
 
 
+def load_model_from_save(model, save_path, optimizer, device):
+    save = torch.load(save_path, map_location=device)
+
+    model.load_state_dict(save["model"])
+
+    start_step = save["step"] + 1
+    val_save_loss = save["val_loss"]
+
+    optimizer.load_state_dict(save["optimizer"])
+
+    torch.set_rng_state(save["rng_state"])
+    torch.cuda.set_rng_state_all(save["cuda_rng_state"])
+
+    print(f"Loaded model from train step {start_step} with val loss {val_save_loss}")
+
+    return start_step, val_save_loss
+
 
 
 # ------------------------------------ TRAIN MODEL ---------------------------------------------
@@ -330,274 +347,273 @@ def get_most_likely_row(tokens, mask, logits):
 # torchrun --standalone --nproc_per_node=num_gpus train_gpt2.py
 # torchrun would set the RANK, LOCAL_RANK, and WORLD_SIZE env variables
 
-from torch.distributed import init_process_group, destroy_process_group
-from torch.nn.parallel import DistributedDataParallel as DDP
-# we will use DDP (distributed data parallel to distribute processes among the gpus)
-import torch.distributed as dist
+if __name__ == "__main__":
+    from torch.distributed import init_process_group, destroy_process_group
+    from torch.nn.parallel import DistributedDataParallel as DDP
+    # we will use DDP (distributed data parallel to distribute processes among the gpus)
+    import torch.distributed as dist
 
 
-ddp = int(os.environ.get("RANK", -1)) != -1 # checks if RANK var exists in environment
-
-if ddp:
-    assert torch.cuda.is_available(), "lets use CUDA please"
-    init_process_group(backend="nccl") # nccl for CUDA
-    ddp_rank = int(os.environ["RANK"]) # global id for each process (same as local b/c only one machine)
-    ddp_local_rank = int(os.environ["LOCAL_RANK"]) # local id for each process
-    ddp_world_size = int(os.environ["WORLD_SIZE"]) # total num of processes (GPUs)
-
-    device = f"cuda:{ddp_local_rank}"
-    torch.cuda.set_device(device)
-    master_process = ddp_rank == 0 # master process will do logging, checkpointing
-else:
-    # no DDP
-    ddp_rank = 0
-    ddp_local_rank = 0
-    ddp_world_size = 1
-    master_process = True
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
-
-
-device_type = "cuda" if device.startswith("cuda") else "cpu"
-
-
-torch.manual_seed(1337)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed(1337)
-
-enc = tiktoken.get_encoding("gpt2")
-
-# print("NOTE: Remove 1/32 scale factor when on cloud gpu")
-total_batch_size = 524288 # measured in total number of tokens
-# We use this b/c it is 2**19, close to openai's 0.5M
-
-# We simulate 0.5M batch size by doing many forward, backward passes, accumulating the gradient
-
-B = 128 # micro batch size
-T = 1024 # sequence length (num tokens)
-
-assert total_batch_size % (B * T) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
-grad_accum_steps = total_batch_size // (B * T * ddp_world_size) # each process is doing B*T tokens each micro-step
-
-if master_process:
-    print(f"desired total batch size: {total_batch_size}")
-    print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
-
-
-train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
-val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
-
-# print("NOTE: Use TF32 when on cloud GPU")
-torch.set_float32_matmul_precision("high") # use TF32 (lower precision then FP32, but faster)
-# variables are still FP32, but the matrix multi are TF32
-
-
-model = GPT(GPTConfig(vocab_size=50304)).to(device) # use 50304 instead of 50257 b/c it is a much nicer number (divisible by 128)
-compiled_model = torch.compile(model)
-# What torch.compile() does:
-# 1. Views the entire network as a whole, allowing for more efficient processing and minimizes Python interpreter overhead
-# 2. Reduces read/write time btwn gpu and memory with operator fusion. This also mitigates memory bandwidth cost.
-
-if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank]) # synchronize gradients across processes
-    # every process will have the avg of the gradients across all the processes
-raw_model = model.module if ddp else model
-
-max_lr = 6e-4
-min_lr = max_lr * 0.1
-warmup_steps = 715 # openai warmed up for 375M tokens, 375M // total_batch_size = 715
-max_steps = 19073 * 2 # 10B tokens // total_batch_size = steps for one epoch
-
-def get_lr(it):
-  # linear warmup for first warmup_steps steps
-  if it < warmup_steps:
-    return max_lr * (it+1) / warmup_steps # linearly increasing lr to max_Lr
-
-  # use min_lr after we do our lr decay
-  if it > max_steps:
-      return min_lr
-
-  # when in between, we cosine decay to min lr
-  decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps) # don't include the warmup steps
-  assert 0 <= decay_ratio <= 1
-  coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # start at 1 and goes to 0
-  return min_lr + (max_lr - min_lr) * coeff
-
-
-optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
-
-log_dir = "log"
-os.makedirs(log_dir, exist_ok = True)
-log_file = os.path.join(log_dir, "log.txt")
-
-# with open(log_file, "w") as f:
-#     pass # clear the log_file
-
-save = torch.load("log/model_19072.pt")
-model.load_state_dict(save["model"])
-start_step = save["step"]
-val_save_loss = save["val_loss"]
-optimizer.load_state_dict(save["optimizer"])
-torch.set_rng_state(save["rng_state"])
-torch.cuda.set_rng_state_all(save["cuda_rng_state"])
-
-
-for step in range(start_step, max_steps):
-    t0 = time.time()
-
-    last_step = (step == max_steps - 1)
-
-    # evaluate using val data every 250 steps
-    if step % 250 == 0 or last_step:
-        model.eval()
-        val_loader.reset()
-        with torch.inference_mode():
-            val_loss_accum = 0.0
-            val_loss_steps = 20
-            for _ in range(val_loss_steps):
-                x, y = val_loader.next_batch()
-                x, y = x.to(device), y.to(device)
-                with torch.autocast(device_type=device, dtype=torch.bfloat16):
-                    logits, loss = compiled_model(x, y)
-                # logits, loss = model(x, y)
-                loss /= val_loss_steps
-                val_loss_accum += loss.detach()
-        if ddp:
-            dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
-        if master_process:
-            print(f"Validation loss: {val_loss_accum.item():.4f}")
-            with open(log_file, "a") as f: # a is for append
-                f.write(f"{step} val {val_loss_accum.item():.4f}\n")
-            
-            if step > 0 and (step % 500 == 0 or last_step):
-                checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
-
-                checkpoint = {
-                    "model": raw_model.state_dict(),
-                    "step": step,
-                    "val_loss": val_loss_accum.item(),
-                    "optimizer": optimizer.state_dict(),
-                    "rng_state": torch.get_rng_state(),
-                    "cuda_rng_state": torch.cuda.get_rng_state_all(),
-                }
-
-                torch.save(checkpoint, checkpoint_path)
-                print(f"Checkpoint saved to {checkpoint_path}")
-
-    # evaluate using goldenswag every 250 steps
-    if master_process and (step % 250 == 0 or last_step):
-        model.eval()
-
-        num_correct = 0
-        num_examples = 0
-
-        gs = load_dataset("PleIAs/GoldenSwag", split="validation")
-        for i, example in enumerate(gs):
-
-            tokens, mask, label = render_example(example)
-            tokens = tokens.to(device)
-            mask = mask.to(device)
-
-            with torch.inference_mode():
-                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, _ = model(tokens)
-                # logits, _ = model(tokens)
-                pred = get_most_likely_row(tokens, mask, logits)
-
-            num_examples += 1
-            num_correct += int(pred == int(label))
-
-
-        if ddp:
-            # sync across all processes
-            num_examples = torch.tensor(num_examples, dtype=torch.long, device=device)
-            num_correct = torch.tensor(num_correct, dtype=torch.long, device=device)
-            
-            dist.all_reduce(num_examples, op=dist.ReduceOp.SUM)
-            dist.all_reduce(num_correct, op=dist.ReduceOp.SUM)
-
-            num_examples = num_examples.item()
-            num_correct = num_correct.item()
-
-        acc = num_correct / num_examples
-        
-        print(f"Goldenswag accuracy: {num_correct}/{num_examples}={acc:.4f}")
-        with open(log_file, "a") as f:
-            f.write(f"{step} goldenswag {acc:.4f}\n")
-
-
-
-    # generate samples every 250 steps (not including step 0)
-    if step > 0 and step % 250 == 0 or last_step:
-        model.eval()
-        num_return_sequences = 4
-        max_length = 32
-        tokens = enc.encode("Hello, I'm a language model,")
-        tokens = torch.tensor(tokens, dtype=torch.long) # (8, )
-        tokens = tokens.unsqueeze(dim=0).repeat(num_return_sequences, 1) # (num_return_sequences, 8)
-        x = tokens.to(device)
-
-        sample_rng = torch.Generator(device=device)
-
-        sample_rng.manual_seed(42+ddp_rank) # get different results for each process w/o affecting global rng 
-        while x.size(1) < max_length:
-            with torch.inference_mode():
-                logits, _ = model(x) # (B, T, vocab_size)
-                logits = logits[:, -1, :] # (B, vocab_size)
-                probs = F.softmax(logits, dim=-1)
-                topk_probs, topk_indices = torch.topk(probs, 50, dim=-1) # (B, 50)
-                # select a token
-                ix = torch.multinomial(topk_probs, 1, generator=sample_rng) # (B, 1)
-                xcol = torch.gather(topk_indices, -1, ix) # get the element at the index for each batch
-                x = torch.cat((x, xcol), dim=1)
-        
-        for i in range(num_return_sequences):
-            tokens = x[i].tolist()
-            decoded = enc.decode(tokens)
-            print(f"rank {ddp_rank}, sample #{i}: {decoded}")
-
-    model.train()
-    
-    optimizer.zero_grad() # only zero grad every grad_accum_steps
-
-    loss_accum = 0.0
-    for micro_step in range(grad_accum_steps):
-        x, y = train_loader.next_batch()
-        x, y = x.to(device), y.to(device)
-
-        # if micro_step==0 and step==0: print("NOTE: Enable autocast for bf16 when on cloud gpu")
-        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-            logits, loss = compiled_model(x, y) # actually changes the datatype of logits, but others remain FP32 (mixed precision)
-        # logits, loss = model(x, y)
-        loss /= grad_accum_steps
-        loss_accum += loss.detach() # don't want to track gradients here
-        if ddp:
-            model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1) # don't need to grad sync every micro step
-        loss.backward()
+    ddp = int(os.environ.get("RANK", -1)) != -1 # checks if RANK var exists in environment
 
     if ddp:
-        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG) # averages the loss_accum across all processes and deposits that value
+        assert torch.cuda.is_available(), "lets use CUDA please"
+        init_process_group(backend="nccl") # nccl for CUDA
+        ddp_rank = int(os.environ["RANK"]) # global id for each process (same as local b/c only one machine)
+        ddp_local_rank = int(os.environ["LOCAL_RANK"]) # local id for each process
+        ddp_world_size = int(os.environ["WORLD_SIZE"]) # total num of processes (GPUs)
 
-    # square all the gradients, add them up, and take sqrt to get grad norm
-    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) # cap gradient norm at 1.0
+        device = f"cuda:{ddp_local_rank}"
+        torch.cuda.set_device(device)
+        master_process = ddp_rank == 0 # master process will do logging, checkpointing
+    else:
+        # no DDP
+        ddp_rank = 0
+        ddp_local_rank = 0
+        ddp_world_size = 1
+        master_process = True
 
-    lr = get_lr(step)
-    for param_group in optimizer.param_groups:
-        param_group["lr"] = lr
-    optimizer.step()
-    
-    if device_type == "cuda":
-        torch.cuda.synchronize() # wait for gpu to finish scheduled work before continuing
-    t1 = time.time()
-    dt = t1 - t0 # time diff in seconds
-    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
-    tokens_per_sec = tokens_processed / dt
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"Using device: {device}")
 
+
+    device_type = "cuda" if device.startswith("cuda") else "cpu"
+
+
+    torch.manual_seed(1337)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(1337)
+
+    enc = tiktoken.get_encoding("gpt2")
+
+    # print("NOTE: Remove 1/32 scale factor when on cloud gpu")
+    total_batch_size = 524288 # measured in total number of tokens
+    # We use this b/c it is 2**19, close to openai's 0.5M
+
+    # We simulate 0.5M batch size by doing many forward, backward passes, accumulating the gradient
+
+    B = 4 # 128 # micro batch size
+    T = 1024 # sequence length (num tokens)
+
+    assert total_batch_size % (B * T) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
+    grad_accum_steps = total_batch_size // (B * T * ddp_world_size) # each process is doing B*T tokens each micro-step
+    grad_accum_steps = 1
     if master_process:
-        print(f"step: {step:5d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms, tok/sec: {tokens_per_sec:.2f}")
-        with open(log_file, "a") as f:
-            f.write(f"{step} train {loss_accum.item():.6f}\n")
+        print(f"desired total batch size: {total_batch_size}")
+        print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
-if ddp:
-    destroy_process_group()
+
+    train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
+    val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
+
+    # print("NOTE: Use TF32 when on cloud GPU")
+    torch.set_float32_matmul_precision("high") # use TF32 (lower precision then FP32, but faster)
+    # variables are still FP32, but the matrix multi are TF32
+
+
+    model = GPT(GPTConfig(vocab_size=50304)).to(device) # use 50304 instead of 50257 b/c it is a much nicer number (divisible by 128)
+    compiled_model = torch.compile(model) if device_type == "cuda" else model
+    # What torch.compile() does:
+    # 1. Views the entire network as a whole, allowing for more efficient processing and minimizes Python interpreter overhead
+    # 2. Reduces read/write time btwn gpu and memory with operator fusion. This also mitigates memory bandwidth cost.
+
+    if ddp:
+        model = DDP(model, device_ids=[ddp_local_rank]) # synchronize gradients across processes
+        # every process will have the avg of the gradients across all the processes
+
+    max_lr = 6e-4
+    min_lr = max_lr * 0.1
+    warmup_steps = 715 # openai warmed up for 375M tokens, 375M // total_batch_size = 715
+    decay_steps = 19073 
+    max_steps = 19073 # 10B tokens // total_batch_size = steps for one epoch
+
+
+    def get_lr(it):
+        # linear warmup for first warmup_steps steps
+        if it < warmup_steps:
+            return max_lr * (it+1) / warmup_steps # linearly increasing lr to max_Lr
+
+        # use min_lr after we do our lr decay
+        if it > decay_steps:
+            return min_lr
+
+        # when in between, we cosine decay to min lr
+        decay_ratio = (it - warmup_steps) / (decay_steps - warmup_steps) # don't include the warmup steps
+        assert 0 <= decay_ratio <= 1
+        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # start at 1 and goes to 0
+        
+        return min_lr + (max_lr - min_lr) * coeff
+
+
+    optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
+
+    log_dir = "log"
+    os.makedirs(log_dir, exist_ok = True)
+    log_file = os.path.join(log_dir, "log.txt")
+
+    # with open(log_file, "w") as f:
+    #     pass # clear the log_file
+
+    # save_model(model, save_path="log/model_19072.pt", device=device)
+
+
+
+    prompt = "Data visualization empowers users to "
+
+    model.generate_text(model, num_return_sequences = 4, max_new_tokens=100, prompt=prompt, temp=0.8)
+
+
+
+    for step in range(max_steps):
+       
+        t0 = time.time()
+
+        last_step = (step == max_steps - 1)
+
+        # evaluate using val data every 250 steps
+        if step % 250 == 0 or last_step:
+        # if step % 250 == 0 or last_step:
+            model.eval()
+            val_loader.reset()
+            with torch.inference_mode():
+                val_loss_accum = 0.0
+                val_loss_steps = 1 # 20
+                for _ in range(val_loss_steps):
+                    x, y = val_loader.next_batch()
+                    x, y = x.to(device), y.to(device)
+                    if device_type == "cuda": 
+                        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                            logits, loss = compiled_model(x, y)
+                    else: logits, loss = model(x, y)
+                    loss /= val_loss_steps
+                    val_loss_accum += loss.detach()
+            if ddp:
+                dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+            if master_process:
+                print(f"Validation loss: {val_loss_accum.item():.4f}")
+                with open(log_file, "a") as f: # a is for append
+                    f.write(f"{step} val {val_loss_accum.item():.4f}\n")
+                
+                if step > 0 and (step % 500 == 0 or last_step):
+                    checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+
+                    checkpoint = {
+                        "model": model.state_dict(),
+                        "step": step,
+                        "val_loss": val_loss_accum.item(),
+                        "optimizer": optimizer.state_dict(),
+                        "rng_state": torch.get_rng_state(),
+                        "cuda_rng_state": torch.cuda.get_rng_state_all(),
+                    }
+
+                    torch.save(checkpoint, checkpoint_path)
+                    print(f"Checkpoint saved to {checkpoint_path}")
+
+        # evaluate using goldenswag every 250 steps
+        if master_process and (step % 250 == 0 or last_step):
+            model.eval()
+
+            num_correct = 0
+            num_examples = 0
+
+            gs = load_dataset("PleIAs/GoldenSwag", split="validation")
+            for i, example in enumerate(gs):
+
+                tokens, mask, label = render_example(example)
+                tokens = tokens.to(device)
+                mask = mask.to(device)
+
+                with torch.inference_mode():
+                    if device_type == "cuda":
+                        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                            logits, _ = model(tokens)
+                    else:
+                        logits, _ = model(tokens)
+
+                    pred = get_most_likely_row(tokens, mask, logits)
+
+                num_examples += 1
+                num_correct += int(pred == int(label))
+
+                if num_examples == 5:
+                    break
+
+
+                    
+                
+
+            if ddp:
+                # sync across all processes
+                num_examples = torch.tensor(num_examples, dtype=torch.long, device=device)
+                num_correct = torch.tensor(num_correct, dtype=torch.long, device=device)
+                
+                dist.all_reduce(num_examples, op=dist.ReduceOp.SUM)
+                dist.all_reduce(num_correct, op=dist.ReduceOp.SUM)
+
+                num_examples = num_examples.item()
+                num_correct = num_correct.item()
+
+            acc = num_correct / num_examples
+            
+            print(f"Goldenswag accuracy: {num_correct}/{num_examples}={acc:.4f}")
+            with open(log_file, "a") as f:
+                f.write(f"{step} goldenswag {acc:.4f}\n")
+
+            
+
+
+
+        # generate samples every 250 steps (not including step 0)
+        if step > 0 and step % 250 == 0 or last_step:
+            sample_rng = torch.Generator(device=device)
+
+            model.generate_text(4, 32, "The study of quantum mechanics", sample_rng)
+            
+            
+
+        model.train()
+        
+        optimizer.zero_grad() # only zero grad every grad_accum_steps
+
+        loss_accum = 0.0
+        for micro_step in range(grad_accum_steps):
+            x, y = train_loader.next_batch()
+            x, y = x.to(device), y.to(device)
+
+            # if micro_step==0 and step==0: print("NOTE: Enable autocast for bf16 when on cloud gpu")
+            if device_type == "cuda":
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                    logits, loss = compiled_model(x, y) # actually changes the datatype of logits, but others remain FP32 (mixed precision)
+            else:
+                logits, loss = model(x, y)
+            loss /= grad_accum_steps
+            loss_accum += loss.detach() # don't want to track gradients here
+            if ddp:
+                model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1) # don't need to grad sync every micro step
+            loss.backward()
+
+        if ddp:
+            dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG) # averages the loss_accum across all processes and deposits that value
+
+        # square all the gradients, add them up, and take sqrt to get grad norm
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) # cap gradient norm at 1.0
+
+        lr = get_lr(step)
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = lr
+        optimizer.step()
+        
+        if device_type == "cuda":
+            torch.cuda.synchronize() # wait for gpu to finish scheduled work before continuing
+        t1 = time.time()
+        dt = t1 - t0 # time diff in seconds
+        tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
+        tokens_per_sec = tokens_processed / dt
+
+        if master_process:
+            print(f"step: {step:5d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms, tok/sec: {tokens_per_sec:.2f}")
+            with open(log_file, "a") as f:
+                f.write(f"{step} train {loss_accum.item():.6f}\n")
+
+    if ddp:
+        destroy_process_group()

@@ -63,9 +63,12 @@ def render_example(example):
 
 @torch.inference_mode()
 def evaluate(model_type, device):
-    torch.set_float32_matmul_precision("high") # tf32
+
     model = GPT2LMHeadModel.from_pretrained(model_type).to(device)
-    # model = torch.compile(model)
+    
+    if device == "cuda": 
+        torch.set_float32_matmul_precision("high") # tf32
+        model = torch.compile(model)
 
 
     num_correct = 0
