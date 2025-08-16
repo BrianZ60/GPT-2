@@ -1,2 +1,2 @@
 # GPT-2
-Reproduction of the GPT-2 (124M) language model following Andrej Karpathy's "Let's reproduce GPT-2 (124M)" video
+My implementation of GPT-2 (124M), inspired by Andrej Karpathy's "_Let's Reproduce GPT-2 (124M)_" video, with explanatory notes and my own additional implementations throughout.
