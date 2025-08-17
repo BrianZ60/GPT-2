@@ -271,27 +271,45 @@ class DataLoaderLite:
         assert len(shards) > 0, f"No shards found for split {split}!"
         if master_process:
             print(f"found {len(shards)} shards for split {split}")
+
         self.reset()
+
+    def load_shard(self, idx):
+        self.shard_tokens = load_tokens(filename=self.shards[idx])
+        num_blocks = (len(self.shard_tokens) - 1) // self.T
+        self.block_offsets = torch.arange(num_blocks) * self.T
+        self.rand_block_offsets = self.block_offsets[torch.randperm(num_blocks)]
+
+        self.current_position = self.B * self.process_rank
+       
 
     def reset(self):
         self.current_shard = 0
-        self.shard_tokens = load_tokens(filename=self.shards[self.current_shard])
-        self.current_position = self.B * self.T * self.process_rank
+        self.load_shard(self.current_shard)
 
 
     def next_batch(self):
         B, T = self.B, self.T
-        buf = self.shard_tokens[self.current_position : self.current_position + B * T + 1]
-        x = buf[:-1].view(B, T)
-        y = buf[1:].view(B, T)
 
-        self.current_position += B * T * self.num_processes # this way, we train on a block of num_processes batches in parallel
+        batch_offsets = self.rand_block_offsets[self.current_position : self.current_position + self.B] # (B, )
+
+        x_list, y_list = [], []
+        for offset in batch_offsets:
+            buf = self.shard_tokens[offset : offset + T + 1] # get random block of T+1 tokens
+            x_list.append(buf[:-1]) # input
+            y_list.append(buf[1:]) # labels
+
+        x = torch.stack(x_list, dim=0)
+        y = torch.stack(y_list, dim=0)
+
+
+        self.current_position += B * self.num_processes # this way, we train on a block of num_processes batches in parallel
 
         # if loading the next batch would be out of bounds, advance to next shard
-        if self.current_position + B * T * self.num_processes + 1 >= len(self.shard_tokens):
+        if self.current_position >= len(self.rand_block_offsets):
             self.current_shard = (self.current_shard + 1) % len(self.shards) # loop shard if need to
-            self.shard_tokens = load_tokens(self.shards[self.current_shard])
-            self.current_position = B * T * self.process_rank
+            self.load_shard(self.current_shard)
+            self.current_position = B * self.process_rank
         return x, y
 
 
