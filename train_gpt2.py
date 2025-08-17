@@ -21,7 +21,7 @@ class CasualSelfAttention(nn.Module):
         # k,q,v projections for all heads
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
-        self.c_proj.SCALE_INIT = 1.0
+        self.c_proj.SCALE_INIT = 1.0 # type: ignore
 
         self.n_head = config.n_head
         self.n_embd = config.n_embd
@@ -62,7 +62,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.gelu = nn.GELU(approximate="tanh")
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
-        self.c_proj.SCALE_INIT = 1.0
+        self.c_proj.SCALE_INIT =  1.0 # type: ignore
 
     def forward(self, x):
         x = self.c_fc(x) # linear expansion
@@ -115,7 +115,7 @@ class GPT(nn.Module):
         # we do this because they are to an extent, inverses
         # we also expect the wte to react similarly for synonyms, and the lm_head to give synonyms similar scores
         # for more information, see https://arxiv.org/pdf/1608.05859
-        self.transformer.wte.weight = self.lm_head.weight # also saves a lot of parameters
+        self.transformer.wte.weight = self.lm_head.weight # type: ignore # also saves a lot of parameters
 
         # init params
         self.apply(self._init_weights) # apply to every submodule
@@ -138,13 +138,13 @@ class GPT(nn.Module):
         B, T = idx.shape
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
         pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # (T)
-        pos_emb = self.transformer.wpe(pos) # (T, n_embd)
-        tok_emb = self.transformer.wte(idx) # (B, T, n_embd)
+        pos_emb = self.transformer.wpe(pos) # type: ignore # (T, n_embd)
+        tok_emb = self.transformer.wte(idx) # type: ignore # (B, T, n_embd)
         x = tok_emb + pos_emb
 
-        for block in self.transformer.h:
+        for block in self.transformer.h: # type: ignore
             x = block(x)
-        x = self.transformer.ln_f(x)
+        x = self.transformer.ln_f(x) # type: ignore
 
         logits = self.lm_head(x) # (B, T, vocab_size)
 
@@ -293,15 +293,21 @@ class DataLoaderLite:
 
         batch_offsets = self.rand_block_offsets[self.current_position : self.current_position + self.B] # (B, )
 
-        x_list, y_list = [], []
-        for offset in batch_offsets:
-            buf = self.shard_tokens[offset : offset + T + 1] # get random block of T+1 tokens
-            x_list.append(buf[:-1]) # input
-            y_list.append(buf[1:]) # labels
+        # x_list, y_list = [], []
+        # for offset in batch_offsets:
+        #     buf = self.shard_tokens[offset : offset + T + 1] # get random block of T+1 tokens
+        #     x_list.append(buf[:-1]) # input
+        #     y_list.append(buf[1:]) # labels
 
-        x = torch.stack(x_list, dim=0)
-        y = torch.stack(y_list, dim=0)
+        # x = torch.stack(x_list, dim=0)
+        # y = torch.stack(y_list, dim=0)
 
+
+        # cleaner implementation
+        indices = torch.arange(T+1) + batch_offsets.unsqueeze(dim=1) # (B, T+1)
+        bufs = self.shard_tokens[indices] # (B, T+1)
+        x = bufs[:, :-1]
+        y = bufs[:, 1:]
 
         self.current_position += B * self.num_processes # this way, we train on a block of num_processes batches in parallel
 
@@ -463,7 +469,7 @@ if __name__ == "__main__":
         return min_lr + (max_lr - min_lr) * coeff
 
 
-    optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
+    optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device) # type: ignore
 
     log_dir = "log"
     os.makedirs(log_dir, exist_ok = True)
@@ -478,7 +484,7 @@ if __name__ == "__main__":
 
     prompt = "Data visualization empowers users to "
 
-    model.generate_text(model, num_return_sequences = 4, max_new_tokens=100, prompt=prompt, temp=0.8)
+    model.generate_text(model, num_return_sequences = 4, max_new_tokens=100, prompt=prompt, temp=0.8) # type: ignore
 
 
 
@@ -508,9 +514,9 @@ if __name__ == "__main__":
             if ddp:
                 dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
             if master_process:
-                print(f"Validation loss: {val_loss_accum.item():.4f}")
+                print(f"Validation loss: {val_loss_accum.item():.4f}") # type: ignore
                 with open(log_file, "a") as f: # a is for append
-                    f.write(f"{step} val {val_loss_accum.item():.4f}\n")
+                    f.write(f"{step} val {val_loss_accum.item():.4f}\n") # type: ignore
                 
                 if step > 0 and (step % 500 == 0 or last_step):
                     checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
@@ -518,7 +524,7 @@ if __name__ == "__main__":
                     checkpoint = {
                         "model": model.state_dict(),
                         "step": step,
-                        "val_loss": val_loss_accum.item(),
+                        "val_loss": val_loss_accum.item(), # type: ignore
                         "optimizer": optimizer.state_dict(),
                         "rng_state": torch.get_rng_state(),
                         "cuda_rng_state": torch.cuda.get_rng_state_all(),
@@ -585,7 +591,7 @@ if __name__ == "__main__":
         if step > 0 and step % 250 == 0 or last_step:
             sample_rng = torch.Generator(device=device)
 
-            model.generate_text(4, 32, "The study of quantum mechanics", sample_rng)
+            model.generate_text(4, 32, "The study of quantum mechanics", sample_rng) # type: ignore
             
             
 
@@ -607,7 +613,7 @@ if __name__ == "__main__":
             loss /= grad_accum_steps
             loss_accum += loss.detach() # don't want to track gradients here
             if ddp:
-                model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1) # don't need to grad sync every micro step
+                model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1) # type: ignore # don't need to grad sync every micro step
             loss.backward()
 
         if ddp:
@@ -629,9 +635,9 @@ if __name__ == "__main__":
         tokens_per_sec = tokens_processed / dt
 
         if master_process:
-            print(f"step: {step:5d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms, tok/sec: {tokens_per_sec:.2f}")
+            print(f"step: {step:5d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms, tok/sec: {tokens_per_sec:.2f}") # type: ignore
             with open(log_file, "a") as f:
-                f.write(f"{step} train {loss_accum.item():.6f}\n")
+                f.write(f"{step} train {loss_accum.item():.6f}\n") # type: ignore
 
     if ddp:
         destroy_process_group()
