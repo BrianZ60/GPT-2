@@ -152,7 +152,7 @@ class GPT(nn.Module):
         loss = None
         if targets is not None:
             # flatten logits into (B*T, vocab_size) and targets into (B*T)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
         return logits, loss
 
     @classmethod
@@ -240,6 +240,10 @@ class GPT(nn.Module):
 
 
 
+# END OF MODEL CODE
+
+
+
 import tiktoken
 import numpy as np
 
@@ -252,15 +256,14 @@ def load_tokens(filename):
     return pytorch_tokens
 
 class DataLoaderLite:
-    def __init__(self, B, T, process_rank, num_processes, split):
+    def __init__(self, B, T, split):
         self.B = B
         self.T = T
-        self.process_rank = process_rank
-        self.num_processes = num_processes
         assert split in {"train", "val"}
 
         # get each shard's filename
         data_root_dir = "fineweb-edu-10B"
+        # data_root_dir = "/content/drive/MyDrive/fineweb-edu-10B"
         shards = os.listdir(data_root_dir) # get all file names
         shards = [shard_name for shard_name in shards if split in shard_name]
         shards = sorted(shards)
@@ -269,8 +272,7 @@ class DataLoaderLite:
         self.shards = shards
 
         assert len(shards) > 0, f"No shards found for split {split}!"
-        if master_process:
-            print(f"found {len(shards)} shards for split {split}")
+        print(f"found {len(shards)} shards for split {split}")
 
         self.reset()
 
@@ -280,8 +282,8 @@ class DataLoaderLite:
         self.block_offsets = torch.arange(num_blocks) * self.T
         self.rand_block_offsets = self.block_offsets[torch.randperm(num_blocks)]
 
-        self.current_position = self.B * self.process_rank
-       
+        self.current_position = self.B
+
 
     def reset(self):
         self.current_shard = 0
@@ -309,18 +311,18 @@ class DataLoaderLite:
         x = bufs[:, :-1]
         y = bufs[:, 1:]
 
-        self.current_position += B * self.num_processes # this way, we train on a block of num_processes batches in parallel
+        self.current_position += B
 
         # if loading the next batch would be out of bounds, advance to next shard
         if self.current_position >= len(self.rand_block_offsets):
             self.current_shard = (self.current_shard + 1) % len(self.shards) # loop shard if need to
             self.load_shard(self.current_shard)
-            self.current_position = B * self.process_rank
+            self.current_position = 0
         return x, y
 
 
 def get_most_likely_row(tokens, mask, logits):
-    
+
     shift_logits = (logits[:, :-1, :]).contiguous() # we don't want the logits for the next token after the ending
     shift_tokens = (tokens[:, 1:]).contiguous() # get all the tokens except for the first; the next tokens
 
@@ -332,7 +334,7 @@ def get_most_likely_row(tokens, mask, logits):
 
     shift_losses = shift_losses.view(tokens.size(0), -1)
 
-    shift_mask = (mask[:, 1:]).contiguous() 
+    shift_mask = (mask[:, 1:]).contiguous()
     masked_shift_losses = shift_losses * shift_mask # only want losses of ending tokens
 
     sum_loss = masked_shift_losses.sum(dim=1)
@@ -343,8 +345,59 @@ def get_most_likely_row(tokens, mask, logits):
     return pred
 
 
+
+def generate_text(model, prompt, device, num_return_sequences=1, max_new_tokens=50, temp=0.8, top_k = 50):
+
+    model.eval()
+
+    sample_rng = torch.Generator(device=device)
+    sample_rng.manual_seed(random.randint(0, 2**32 - 1))
+    # sample_rng.manual_seed(42) # get different results for each process w/o affecting global rng
+
+    enc = tiktoken.get_encoding("gpt2")
+    tokens = enc.encode(prompt)
+
+    tokens = torch.tensor(tokens, dtype=torch.long) # (sequence_length, )
+    tokens = tokens.unsqueeze(dim=0).repeat(num_return_sequences, 1) # (num_return_sequences, sequence_length)
+    x = tokens.to(device)
+
+    for t in range(max_new_tokens):
+        with torch.inference_mode():
+            logits, _ = model(x) # (B, T, vocab_size)
+            logits = logits[:, -1, :] # (B, vocab_size)
+
+            if temp == 0:
+                next_token = torch.argmax(logits, dim=-1).unsqueeze(-1)
+
+            else:
+                logits = logits / temp
+                probs = F.softmax(logits, dim=-1)
+                topk_probs, topk_indices = torch.topk(probs, top_k, dim=-1) # (B, 50)
+                # select a token
+                ix = torch.multinomial(topk_probs, 1, generator=sample_rng) # (B, 1)
+                next_token = torch.gather(topk_indices, -1, ix) # get the element at the index for each batch
+                x = torch.cat((x, next_token), dim=1)
+
+        if num_return_sequences == 1:
+            token_id = next_token[0, 0].item()
+            decoded_token = enc.decode([token_id])
+
+            if t == 0:
+                print(f"{prompt}{decoded_token}", end="")
+            else:
+                print(decoded_token, end="")
+
+    if num_return_sequences > 1:
+        for i in range(num_return_sequences):
+            tokens = x[i].tolist()
+            decoded = enc.decode(tokens)
+            print(f"\nSequence #{i+1}: {decoded}")
+
+
+
+
 def load_model_from_save(model, save_path, optimizer, device):
-    save = torch.load(save_path, map_location=device)
+    save = torch.load(save_path, map_location="cpu")
 
     model.load_state_dict(save["model"])
 
@@ -372,34 +425,9 @@ def load_model_from_save(model, save_path, optimizer, device):
 # torchrun would set the RANK, LOCAL_RANK, and WORLD_SIZE env variables
 
 if __name__ == "__main__":
-    from torch.distributed import init_process_group, destroy_process_group
-    from torch.nn.parallel import DistributedDataParallel as DDP
-    # we will use DDP (distributed data parallel to distribute processes among the gpus)
-    import torch.distributed as dist
 
-
-    ddp = int(os.environ.get("RANK", -1)) != -1 # checks if RANK var exists in environment
-
-    if ddp:
-        assert torch.cuda.is_available(), "lets use CUDA please"
-        init_process_group(backend="nccl") # nccl for CUDA
-        ddp_rank = int(os.environ["RANK"]) # global id for each process (same as local b/c only one machine)
-        ddp_local_rank = int(os.environ["LOCAL_RANK"]) # local id for each process
-        ddp_world_size = int(os.environ["WORLD_SIZE"]) # total num of processes (GPUs)
-
-        device = f"cuda:{ddp_local_rank}"
-        torch.cuda.set_device(device)
-        master_process = ddp_rank == 0 # master process will do logging, checkpointing
-    else:
-        # no DDP
-        ddp_rank = 0
-        ddp_local_rank = 0
-        ddp_world_size = 1
-        master_process = True
-
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"Using device: {device}")
-
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
 
     device_type = "cuda" if device.startswith("cuda") else "cpu"
 
@@ -419,19 +447,18 @@ if __name__ == "__main__":
     B = 4 # 128 # micro batch size
     T = 1024 # sequence length (num tokens)
 
-    assert total_batch_size % (B * T) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
-    grad_accum_steps = total_batch_size // (B * T * ddp_world_size) # each process is doing B*T tokens each micro-step
+    assert total_batch_size % (B * T) == 0, "make sure total_batch_size is divisible by B * T"
+    grad_accum_steps = total_batch_size // (B * T) # each process is doing B*T tokens each micro-step
     grad_accum_steps = 1
-    if master_process:
-        print(f"desired total batch size: {total_batch_size}")
-        print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+    print(f"desired total batch size: {total_batch_size}")
+    print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
 
-    train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
-    val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
+    train_loader = DataLoaderLite(B=B, T=T, split="train")
+    val_loader = DataLoaderLite(B=B, T=T, split="val")
 
     # print("NOTE: Use TF32 when on cloud GPU")
-    torch.set_float32_matmul_precision("high") # use TF32 (lower precision then FP32, but faster)
+    # torch.set_float32_matmul_precision("high") # use TF32 (lower precision then FP32, but faster)
     # variables are still FP32, but the matrix multi are TF32
 
 
@@ -441,14 +468,10 @@ if __name__ == "__main__":
     # 1. Views the entire network as a whole, allowing for more efficient processing and minimizes Python interpreter overhead
     # 2. Reduces read/write time btwn gpu and memory with operator fusion. This also mitigates memory bandwidth cost.
 
-    if ddp:
-        model = DDP(model, device_ids=[ddp_local_rank]) # synchronize gradients across processes
-        # every process will have the avg of the gradients across all the processes
-
     max_lr = 6e-4
     min_lr = max_lr * 0.1
     warmup_steps = 715 # openai warmed up for 375M tokens, 375M // total_batch_size = 715
-    decay_steps = 19073 
+    decay_steps = 19073
     max_steps = 19073 # 10B tokens // total_batch_size = steps for one epoch
 
 
@@ -465,76 +488,74 @@ if __name__ == "__main__":
         decay_ratio = (it - warmup_steps) / (decay_steps - warmup_steps) # don't include the warmup steps
         assert 0 <= decay_ratio <= 1
         coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # start at 1 and goes to 0
-        
+
         return min_lr + (max_lr - min_lr) * coeff
 
 
     optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device) # type: ignore
 
+    # log_dir = "/content/drive/MyDrive/Pytorch/"
     log_dir = "log"
     os.makedirs(log_dir, exist_ok = True)
+
     log_file = os.path.join(log_dir, "log.txt")
+    save_path = os.path.join(log_dir, "model_19072.pt")
 
     # with open(log_file, "w") as f:
     #     pass # clear the log_file
 
-    # save_model(model, save_path="log/model_19072.pt", device=device)
+
+    start_step = 0
+    start_step, _ = load_model_from_save(model, save_path=save_path, optimizer=optimizer, device=device)
 
 
+    for step in range(start_step, max_steps):
 
-    prompt = "Data visualization empowers users to "
-
-    model.generate_text(model, num_return_sequences = 4, max_new_tokens=100, prompt=prompt, temp=0.8) # type: ignore
-
-
-
-    for step in range(max_steps):
-       
         t0 = time.time()
 
         last_step = (step == max_steps - 1)
 
         # evaluate using val data every 250 steps
-        if step % 250 == 0 or last_step:
+        if step == 0:
         # if step % 250 == 0 or last_step:
             model.eval()
             val_loader.reset()
             with torch.inference_mode():
                 val_loss_accum = 0.0
-                val_loss_steps = 1 # 20
+                val_loss_steps = 20
                 for _ in range(val_loss_steps):
                     x, y = val_loader.next_batch()
                     x, y = x.to(device), y.to(device)
-                    if device_type == "cuda": 
-                        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                    if device_type == "cuda":
+                        # with torch.autocast(device_type=device, dtype=torch.bfloat16):
                             logits, loss = compiled_model(x, y)
                     else: logits, loss = model(x, y)
                     loss /= val_loss_steps
                     val_loss_accum += loss.detach()
-            if ddp:
-                dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
-            if master_process:
-                print(f"Validation loss: {val_loss_accum.item():.4f}") # type: ignore
-                with open(log_file, "a") as f: # a is for append
-                    f.write(f"{step} val {val_loss_accum.item():.4f}\n") # type: ignore
-                
-                if step > 0 and (step % 500 == 0 or last_step):
-                    checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
 
-                    checkpoint = {
-                        "model": model.state_dict(),
-                        "step": step,
-                        "val_loss": val_loss_accum.item(), # type: ignore
-                        "optimizer": optimizer.state_dict(),
-                        "rng_state": torch.get_rng_state(),
-                        "cuda_rng_state": torch.cuda.get_rng_state_all(),
-                    }
+            print(f"Validation loss: {val_loss_accum.item():.4f}") # type: ignore
+            with open(log_file, "a") as f: # a is for append
+                f.write(f"{step} val {val_loss_accum.item():.4f}\n") # type: ignore
 
-                    torch.save(checkpoint, checkpoint_path)
-                    print(f"Checkpoint saved to {checkpoint_path}")
+            if step > 0 and (step % 500 == 0 or last_step):
+                checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+
+                checkpoint = {
+                    "model": model.state_dict(),
+                    "step": step,
+                    "val_loss": val_loss_accum.item(), # type: ignore
+                    "optimizer": optimizer.state_dict(),
+                    "rng_state": torch.get_rng_state(),
+                    "cuda_rng_state": torch.cuda.get_rng_state_all(),
+                }
+
+                torch.save(checkpoint, checkpoint_path)
+                print(f"Checkpoint saved to {checkpoint_path}")
+
 
         # evaluate using goldenswag every 250 steps
-        if master_process and (step % 250 == 0 or last_step):
+        if step == 0:
+        # if step % 250 == 0 or last_step:
             model.eval()
 
             num_correct = 0
@@ -549,7 +570,7 @@ if __name__ == "__main__":
 
                 with torch.inference_mode():
                     if device_type == "cuda":
-                        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                        # with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
                             logits, _ = model(tokens)
                     else:
                         logits, _ = model(tokens)
@@ -559,44 +580,30 @@ if __name__ == "__main__":
                 num_examples += 1
                 num_correct += int(pred == int(label))
 
-                if num_examples == 5:
+                if num_examples == 20:
                     break
 
 
-                    
-                
-
-            if ddp:
-                # sync across all processes
-                num_examples = torch.tensor(num_examples, dtype=torch.long, device=device)
-                num_correct = torch.tensor(num_correct, dtype=torch.long, device=device)
-                
-                dist.all_reduce(num_examples, op=dist.ReduceOp.SUM)
-                dist.all_reduce(num_correct, op=dist.ReduceOp.SUM)
-
-                num_examples = num_examples.item()
-                num_correct = num_correct.item()
-
             acc = num_correct / num_examples
-            
+
             print(f"Goldenswag accuracy: {num_correct}/{num_examples}={acc:.4f}")
             with open(log_file, "a") as f:
                 f.write(f"{step} goldenswag {acc:.4f}\n")
 
-            
+
 
 
 
         # generate samples every 250 steps (not including step 0)
-        if step > 0 and step % 250 == 0 or last_step:
-            sample_rng = torch.Generator(device=device)
+        if step == 0:
+        # if step > 0 and step % 250 == 0 or last_step:
+            prompt = "I think that artifical intelligence (AI) is"
+            generate_text(model, prompt, device=device, temp=1.2, max_new_tokens=100)
 
-            model.generate_text(4, 32, "The study of quantum mechanics", sample_rng) # type: ignore
-            
-            
+
 
         model.train()
-        
+
         optimizer.zero_grad() # only zero grad every grad_accum_steps
 
         loss_accum = 0.0
@@ -606,18 +613,14 @@ if __name__ == "__main__":
 
             # if micro_step==0 and step==0: print("NOTE: Enable autocast for bf16 when on cloud gpu")
             if device_type == "cuda":
-                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                # with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
                     logits, loss = compiled_model(x, y) # actually changes the datatype of logits, but others remain FP32 (mixed precision)
             else:
                 logits, loss = model(x, y)
             loss /= grad_accum_steps
             loss_accum += loss.detach() # don't want to track gradients here
-            if ddp:
-                model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1) # type: ignore # don't need to grad sync every micro step
             loss.backward()
 
-        if ddp:
-            dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG) # averages the loss_accum across all processes and deposits that value
 
         # square all the gradients, add them up, and take sqrt to get grad norm
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) # cap gradient norm at 1.0
@@ -626,18 +629,14 @@ if __name__ == "__main__":
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
         optimizer.step()
-        
+
         if device_type == "cuda":
             torch.cuda.synchronize() # wait for gpu to finish scheduled work before continuing
         t1 = time.time()
         dt = t1 - t0 # time diff in seconds
-        tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
+        tokens_processed = train_loader.B * train_loader.T * grad_accum_steps
         tokens_per_sec = tokens_processed / dt
 
-        if master_process:
-            print(f"step: {step:5d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms, tok/sec: {tokens_per_sec:.2f}") # type: ignore
-            with open(log_file, "a") as f:
-                f.write(f"{step} train {loss_accum.item():.6f}\n") # type: ignore
-
-    if ddp:
-        destroy_process_group()
+        print(f"step: {step:5d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms, tok/sec: {tokens_per_sec:.2f}") # type: ignore
+        with open(log_file, "a") as f:
+            f.write(f"{step} train {loss_accum.item():.6f}\n") # type: ignore
